@@ -27,11 +27,19 @@
 
 // Kredensial WiFi
 const char* ssid = "Rombongan Bos Reza";       // Nama SSID WiFi
-const char* password = "aaaaaaaa";        // Password WiFi
+const char* password = "aaaaaaaa";            // Password WiFi
+
+// Interval pengambilan gambar (10 detik)
+const unsigned long captureInterval = 20000;
+// Interval pengiriman gambar ke server (2 jam)
+const unsigned long uploadInterval = 7200000;
 
 // Variabel untuk Timer/Millis
-unsigned long previousMillis = 0;
-const int Interval = 20000; // Interval untuk mengambil foto dalam milidetik (20 detik).
+unsigned long lastCaptureTime = 0;
+unsigned long lastUploadTime = 0;
+
+// Variabel untuk menyimpan gambar terakhir
+camera_fb_t *lastCapturedPhoto = NULL;
 
 // Alamat server untuk pengiriman foto
 String serverName = "192.168.18.7";  // Alamat IP atau domain server
@@ -44,54 +52,46 @@ bool LED_Flash_ON = true;
 // Inisialisasi WiFiClient
 WiFiClient client;
 
-// Fungsi untuk mengirim foto ke server
-void sendPhotoToServer() {
-  String AllData;
-  String DataBody;
-
-  Serial.println();
-  Serial.println("-----------");
-
-  // Proses pra-pengambilan foto untuk memastikan timing akurat
-  Serial.println("Mengambil foto...");
-
+// Fungsi untuk mengambil foto
+void capturePhoto() {
   // Nyalakan LED Flash jika diatur ke true
-  if (LED_Flash_ON == true) {
+  if (LED_Flash_ON) {
     digitalWrite(FLASH_LED_PIN, HIGH);
     delay(1000);
   }
 
   // Ambil beberapa frame pertama untuk menstabilkan gambar
   for (int i = 0; i <= 3; i++) {
-    camera_fb_t * fb = NULL;
-    fb = esp_camera_fb_get();
-    if (!fb) {
-      Serial.println("Gagal mengambil foto");
-      Serial.println("Restart ESP32 CAM...");
-      delay(1000);
-      ESP.restart();
-      return;
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (fb) {
+      esp_camera_fb_return(fb);
     }
-    esp_camera_fb_return(fb);
     delay(200);
   }
 
   // Ambil foto yang sebenarnya
-  camera_fb_t * fb = NULL;
-  fb = esp_camera_fb_get();
-  if (!fb) {
+  if (lastCapturedPhoto != NULL) {
+    esp_camera_fb_return(lastCapturedPhoto);
+  }
+  lastCapturedPhoto = esp_camera_fb_get();
+  if (!lastCapturedPhoto) {
     Serial.println("Gagal mengambil foto");
-    Serial.println("Restart ESP32 CAM...");
-    delay(1000);
     ESP.restart();
+  }
+
+  // Matikan LED Flash setelah mengambil gambar
+  if (LED_Flash_ON) digitalWrite(FLASH_LED_PIN, LOW);
+
+  Serial.println("Foto berhasil diambil.");
+}
+
+// Fungsi untuk mengirim foto ke server
+void sendPhotoToServer() {
+  if (lastCapturedPhoto == NULL) {
+    Serial.println("Tidak ada foto untuk dikirim.");
     return;
   }
 
-  if (LED_Flash_ON == true) digitalWrite(FLASH_LED_PIN, LOW);
-
-  Serial.println("Berhasil mengambil foto.");
-
-  // Koneksi ke server
   Serial.println("Menghubungkan ke server: " + serverName);
 
   if (client.connect(serverName.c_str(), serverPort)) {
@@ -102,7 +102,7 @@ void sendPhotoToServer() {
     String head = post_data;
     String boundary = "\r\n--dataMarker--\r\n";
 
-    uint32_t imageLen = fb->len;
+    uint32_t imageLen = lastCapturedPhoto->len;
     uint32_t dataLen = head.length() + boundary.length();
     uint32_t totalLen = imageLen + dataLen;
 
@@ -113,8 +113,8 @@ void sendPhotoToServer() {
     client.println();
     client.print(head);
 
-    uint8_t *fbBuf = fb->buf;
-    size_t fbLen = fb->len;
+    uint8_t *fbBuf = lastCapturedPhoto->buf;
+    size_t fbLen = lastCapturedPhoto->len;
     for (size_t n = 0; n < fbLen; n = n + 1024) {
       if (n + 1024 < fbLen) {
         client.write(fbBuf, 1024);
@@ -126,80 +126,35 @@ void sendPhotoToServer() {
     }
     client.print(boundary);
 
-    esp_camera_fb_return(fb);
-
     // Tunggu respons dari server
-    int timoutTimer = 10000; // Timeout 10 detik
-    long startTimer = millis();
-    boolean state = false;
-    Serial.println("Respons :");
-    while ((startTimer + timoutTimer) > millis()) {
-      Serial.print(".");
-      delay(200);
-
-      // Skip header HTTP
-      while (client.available()) {
-        char c = client.read();
-        if (c == '\n') {
-          if (AllData.length() == 0) { state = true; }
-          AllData = "";
-        } else if (c != '\r') {
-          AllData += String(c);
-        }
-        if (state == true) { DataBody += String(c); }
-        startTimer = millis();
-      }
-      if (DataBody.length() > 0) { break; }
+    Serial.println("Menunggu respons server...");
+    while (client.available()) {
+      String line = client.readStringUntil('\n');
+      Serial.println(line);
     }
     client.stop();
-    Serial.println(DataBody);
-    Serial.println("-----------");
-    Serial.println();
-
+    Serial.println("Foto berhasil dikirim ke server.");
   } else {
     client.stop();
-    DataBody = "Gagal terhubung ke " + serverName;
-    Serial.println(DataBody);
-    Serial.println("-----------");
+    Serial.println("Gagal terhubung ke server.");
   }
 }
 
 // Fungsi setup
 void setup() {
-  // Nonaktifkan detektor brownout
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
-
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Nonaktifkan detektor brownout
   Serial.begin(115200);
-  Serial.println();
-
   pinMode(FLASH_LED_PIN, OUTPUT);
 
-  // Atur ESP32-CAM dalam mode WiFi Station
   WiFi.mode(WIFI_STA);
-  Serial.println();
-
-  // Proses koneksi ke WiFi
-  Serial.println("Menghubungkan ke: " + String(ssid));
   WiFi.begin(ssid, password);
 
-  int timeout = 20 * 2; // Timeout 20 detik
   while (WiFi.status() != WL_CONNECTED) {
     Serial.print(".");
     delay(500);
-    if (timeout > 0) timeout--;
-    if (timeout == 0) {
-      Serial.println();
-      Serial.println("Gagal terhubung ke WiFi. Restart ESP32-CAM...");
-      delay(1000);
-      ESP.restart();
-    }
   }
-
-  Serial.println();
   Serial.println("Berhasil terhubung ke WiFi.");
 
-  // Inisialisasi kamera ESP32-CAM
-  Serial.println("Mengatur kamera ESP32-CAM...");
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -222,62 +177,35 @@ void setup() {
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
 
-  // init with high specs to pre-allocate larger buffers
-  if(psramFound()){
+  if (psramFound()) {
     config.frame_size = FRAMESIZE_UXGA;
-    config.jpeg_quality = 10;  //--> 0-63 lower number means higher quality
+    config.jpeg_quality = 10;
     config.fb_count = 2;
   } else {
     config.frame_size = FRAMESIZE_SVGA;
-    config.jpeg_quality = 8;  //--> 0-63 lower number means higher quality
+    config.jpeg_quality = 8;
     config.fb_count = 1;
   }
-  
-  // camera init
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x", err);
-    Serial.println();
-    Serial.println("Restarting the ESP32 CAM.");
-    delay(1000);
+
+  if (esp_camera_init(&config) != ESP_OK) {
+    Serial.println("Inisialisasi kamera gagal.");
     ESP.restart();
   }
-
-  sensor_t * s = esp_camera_sensor_get();
-
-  // Selectable camera resolution details :
-  // -UXGA   = 1600 x 1200 pixels
-  // -SXGA   = 1280 x 1024 pixels
-  // -XGA    = 1024 x 768  pixels
-  // -SVGA   = 800 x 600   pixels
-  // -VGA    = 640 x 480   pixels
-  // -CIF    = 352 x 288   pixels
-  // -QVGA   = 320 x 240   pixels
-  // -HQVGA  = 240 x 160   pixels
-  // -QQVGA  = 160 x 120   pixels
-  s->set_framesize(s, FRAMESIZE_SXGA); //--> UXGA|SXGA|XGA|SVGA|VGA|CIF|QVGA|HQVGA|QQVGA
-
-  Serial.println();
-  Serial.println("Set camera ESP32 CAM successfully.");
-  //
-
-  Serial.println();
-  Serial.print("ESP32-CAM captures and sends photos to the server every 20 seconds.");
 }
-//________________________________________________________________________________ 
 
-//________________________________________________________________________________ VOID LOOP()
+// Fungsi loop
 void loop() {
-  // put your main code here, to run repeatedly:
-
-  // Timer/Millis to capture and send photos to server every 20 seconds (see Interval variable).
   unsigned long currentMillis = millis();
-  if (currentMillis - previousMillis >= Interval) {
-    previousMillis = currentMillis;
-    
+
+  // Ambil gambar setiap 10 detik
+  if (currentMillis - lastCaptureTime >= captureInterval) {
+    lastCaptureTime = currentMillis;
+    capturePhoto();
+  }
+
+  // Kirim gambar ke server setiap 1 jam
+  if (currentMillis - lastUploadTime >= uploadInterval) {
+    lastUploadTime = currentMillis;
     sendPhotoToServer();
   }
-  
 }
-
-

@@ -1,6 +1,12 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
-#include <TimeLib.h> // Library untuk menangani waktu dan tanggal
+#include <TimeLib.h>
+#include <ArduinoJson.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 3600 * 7, 60000);
 
 #define pumpNutrisi D1
 #define lampuUV D6
@@ -9,28 +15,28 @@
 
 const char* ssid = "Rombongan Bos Reza";
 const char* password = "aaaaaaaa";
-const char* serverIP = "http://192.168.18.7"; 
-const char* insertEndpoint = "/aquagrow/insert.php";            
-const char* timeEndpoint = "/aquagrow/time.php";              
-const char* configEndpoint = "/aquagrow/config.php";           
+const char* serverIP = "http://192.168.18.7";
+const char* insertEndpoint = "/aquagrow/insert.php";
+const char* timeEndpoint = "/aquagrow/time.php";
+const char* configEndpoint = "/aquagrow/config.php";
 
-String serverName = String(serverIP) + insertEndpoint;   
-String timeServer = String(serverIP) + timeEndpoint;     
-String configServer = String(serverIP) + configEndpoint; 
+String serverName = String(serverIP) + insertEndpoint;
+String timeServer = String(serverIP) + timeEndpoint;
+String configServer = String(serverIP) + configEndpoint;
 
+int mingguKe = 1;
+int tdsThreshold = 400;
+int uvStartHour = 8;
+int uvEndHour = 16;
 
-int mingguKe = 1; // Inisialisasi minggu pertama
-int tdsThreshold = 400; // Ambang TDS untuk minggu pertama
-
-int uvStartHour = 8; // Jam mulai periode kerja UV (08:00 pagi)
-int uvEndHour = 16;  // Jam akhir periode kerja UV (16:00 sore)
-
+time_t waktuTanam = 0; // Waktu tanam diambil dari server
 WiFiClient client;
+
+time_t lastPostTime = 0;
 
 void setup() {
   Serial.begin(9600);
 
-  // Koneksi ke WiFi
   WiFi.begin(ssid, password);
   Serial.print("Menghubungkan ke WiFi");
   while (WiFi.status() != WL_CONNECTED) {
@@ -41,83 +47,93 @@ void setup() {
   Serial.print("Terhubung ke WiFi dengan IP: ");
   Serial.println(WiFi.localIP());
 
-  // Inisialisasi pin
   pinMode(pumpNutrisi, OUTPUT);
   pinMode(lampuUV, OUTPUT);
   pinMode(ldrPin, INPUT);
 
-  // Matikan relay di awal
-  digitalWrite(pumpNutrisi, HIGH); // Relay biasanya LOW aktif
+  digitalWrite(pumpNutrisi, HIGH);
   digitalWrite(lampuUV, HIGH);
 
-  if (!syncTimeFromServer()) {
-    Serial.println("Gagal menyinkronkan waktu dari server, menggunakan waktu default.");
-    setTime(0, 0, 0, 19, 11, 2024); // Waktu default
+  timeClient.begin();
+  if (timeClient.update()) {
+    setTime(timeClient.getEpochTime());
+    Serial.println("Waktu sistem berhasil disinkronkan dengan NTP.");
+  } else {
+    Serial.println("Gagal menyinkronkan waktu dengan NTP. Menggunakan waktu default.");
+    setTime(0, 0, 0, 19, 11, 2024);
   }
 
-  // Sinkronisasi konfigurasi awal dari server
+  syncWaktuTanamFromServer();
   syncConfigFromServer();
 }
 
 void loop() {
-  // Update minggu dan TDS threshold setiap Senin
-  if (weekday() == 2) { // 2 = Senin (1 adalah Minggu)
-    tdsThreshold = 400 + (mingguKe - 1) * 200; // Naik 200 tiap minggu
-    mingguKe++;
-    Serial.print("Minggu ke-");
-    Serial.print(mingguKe);
-    Serial.print(" - Ambang TDS: ");
-    Serial.println(tdsThreshold);
+  if (waktuTanam > 0) {
+    mingguKe = (now() - waktuTanam) / (7 * 24 * 60 * 60) + 1;
   }
 
-  // Membaca sensor TDS dari pin analog
+  displayMingguHari();
+
+  if (now() - lastPostTime >= 7200) {
+    if (WiFi.status() == WL_CONNECTED) {
+      HTTPClient http;
+      http.begin(client, serverName);
+      http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+      int tdsValue = analogRead(tdsPin);
+      int ldrValue = digitalRead(ldrPin);
+      String postData = "tds=" + String(tdsValue) + "&ldr=" + String(ldrValue);
+
+      int httpResponseCode = http.POST(postData);
+
+      if (httpResponseCode > 0) {
+        String response = http.getString();
+        Serial.println("Response: " + response);
+        lastPostTime = now();
+      } else {
+        Serial.print("Error in sending POST: ");
+        Serial.println(httpResponseCode);
+      }
+
+      http.end();
+    } else {
+      Serial.println("WiFi Tidak Terhubung");
+    }
+  }
+
   int tdsValue = analogRead(tdsPin);
   Serial.print("Nilai TDS: ");
   Serial.println(tdsValue);
 
-  // Kontrol relay LED A berdasarkan TDS
   if (tdsValue < tdsThreshold) {
-    digitalWrite(pumpNutrisi, LOW); // Menyalakan LED A (LOW aktif)
+    digitalWrite(pumpNutrisi, LOW);
     Serial.println("Pompa Nutrisi: MENYALA");
   } else {
-    digitalWrite(pumpNutrisi, HIGH); // Mematikan LED A
+    digitalWrite(pumpNutrisi, HIGH);
     Serial.println("Pompa Nutrisi: MATI");
   }
 
-  // Kontrol Lampu UV
   controlLampuUV();
-
-  // Mengirim data sensor ke server jika WiFi terhubung
-  if (WiFi.status() == WL_CONNECTED) {
-    HTTPClient http;
-    http.begin(client, serverName);
-
-    // Menambahkan header untuk mengirim data sebagai form-urlencoded
-    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-
-    // Mengirim data sensor dalam format POST
-    String postData = "tds=" + String(tdsValue) + "&ldr=" + String(digitalRead(ldrPin));
-
-    int httpResponseCode = http.POST(postData);
-
-    if (httpResponseCode > 0) {
-      String response = http.getString();
-      Serial.println("Response: " + response);
-    } else {
-      Serial.print("Error in sending POST: ");
-      Serial.println(httpResponseCode);
-    }
-
-    http.end();
-  } else {
-    Serial.println("WiFi Tidak Terhubung");
-  }
-
-  delay(20000); // Interval pengiriman data ke server
+  delay(1000);
 }
 
-// Fungsi untuk menyinkronkan waktu dari server
-bool syncTimeFromServer() {
+void displayMingguHari() {
+  if (waktuTanam > 0) {
+    int totalDays = (now() - waktuTanam) / (24 * 60 * 60);
+    int weeks = totalDays / 7;
+    int days = totalDays % 7;
+
+    Serial.print("Waktu sejak tanam: ");
+    Serial.print(weeks);
+    Serial.print(" minggu ");
+    Serial.print(days);
+    Serial.println(" hari");
+  } else {
+    Serial.println("Waktu tanam belum diatur.");
+  }
+}
+
+void syncWaktuTanamFromServer() {
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
     http.begin(client, timeServer);
@@ -125,44 +141,66 @@ bool syncTimeFromServer() {
     int httpResponseCode = http.GET();
     if (httpResponseCode > 0) {
       String response = http.getString();
-      Serial.println("Response waktu dari server: " + response);
+      Serial.println("Response waktu tanam dari server: " + response);
 
-      // Parsing data waktu (contoh: "2024-11-19 08:30:00")
-      int year, month, day, hour, minute, second;
-      if (sscanf(response.c_str(), "%d-%d-%d %d:%d:%d", &year, &month, &day, &hour, &minute, &second) == 6) {
-        setTime(hour, minute, second, day, month, year);
-        Serial.println("Waktu berhasil disinkronkan.");
-        return true;
+      DynamicJsonDocument doc(512);
+      DeserializationError error = deserializeJson(doc, response);
+
+      if (error) {
+        Serial.print("Error parsing JSON: ");
+        Serial.println(error.c_str());
+        waktuTanam = now(); // Default waktu tanam ke waktu sekarang jika gagal
+        return;
+      }
+
+      if (doc["status"] == "success") {
+        waktuTanam = doc["set_waktu"].as<time_t>();
+        Serial.print("Waktu tanam berhasil diperbarui: ");
+        Serial.println(waktuTanam);
       } else {
-        Serial.println("Format waktu tidak valid.");
+        Serial.println("Gagal mendapatkan waktu tanam dari server.");
+        waktuTanam = now();
       }
     } else {
-      Serial.print("Gagal mendapatkan waktu dari server, kode error: ");
+      Serial.print("Error mendapatkan waktu tanam: ");
       Serial.println(httpResponseCode);
+      waktuTanam = now();
     }
 
     http.end();
+  } else {
+    Serial.println("WiFi Tidak Terhubung untuk sinkronisasi waktu tanam");
+    waktuTanam = now();
   }
-  return false;
 }
 
-// Fungsi untuk sinkronisasi konfigurasi dari server
 void syncConfigFromServer() {
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
-    http.begin(client, configServer);
+    http.begin(client, configServer + "?minggu_ke=" + String(mingguKe));
 
     int httpResponseCode = http.GET();
     if (httpResponseCode > 0) {
       String response = http.getString();
       Serial.println("Response konfigurasi dari server: " + response);
 
-      // Parsing konfigurasi (contoh: "tdsThreshold=500&uvStartHour=9&uvEndHour=17")
-      int newTdsThreshold, newUvStartHour, newUvEndHour;
-      if (sscanf(response.c_str(), "tdsThreshold=%d&uvStartHour=%d&uvEndHour=%d", &newTdsThreshold, &newUvStartHour, &newUvEndHour) == 3) {
-        tdsThreshold = newTdsThreshold;
-        uvStartHour = newUvStartHour;
-        uvEndHour = newUvEndHour;
+      DynamicJsonDocument doc(1024);
+      DeserializationError error = deserializeJson(doc, response);
+
+      if (error) {
+        Serial.print("Error parsing JSON: ");
+        Serial.println(error.c_str());
+        Serial.println("Menggunakan nilai default.");
+        return;
+      }
+
+      if (doc["status"] == "success") {
+        JsonObject data = doc["data"];
+
+        tdsThreshold = data["ambang_tds"] | 400;
+        uvStartHour = data["uv_start_hour"] | 8;
+        uvEndHour = data["uv_end_hour"] | 16;
+
         Serial.println("Konfigurasi berhasil disinkronkan:");
         Serial.print("Ambang TDS: ");
         Serial.println(tdsThreshold);
@@ -171,7 +209,7 @@ void syncConfigFromServer() {
         Serial.print("UV End Hour: ");
         Serial.println(uvEndHour);
       } else {
-        Serial.println("Format konfigurasi tidak valid.");
+        Serial.println("Konfigurasi tidak ditemukan. Menggunakan nilai default.");
       }
     } else {
       Serial.print("Gagal mendapatkan konfigurasi dari server, kode error: ");
@@ -184,22 +222,23 @@ void syncConfigFromServer() {
   }
 }
 
-// Fungsi untuk kontrol Lampu UV
 void controlLampuUV() {
   int currentHour = hour();
   int ldrValue = digitalRead(ldrPin);
 
-  // Periksa apakah saat ini dalam periode kerja UV
+  Serial.print("Jam Saat Ini: ");
+  Serial.println(currentHour);
+
   if (currentHour >= uvStartHour && currentHour < uvEndHour) {
-    if (ldrValue == HIGH) { // Jika ruangan gelap
-      digitalWrite(lampuUV, LOW); // Menyalakan lampu UV (LOW aktif)
+    if (ldrValue == HIGH) {
+      digitalWrite(lampuUV, LOW);
       Serial.println("Lampu UV: MENYALA (Ruangan Gelap)");
     } else {
-      digitalWrite(lampuUV, HIGH); // Mematikan lampu UV
+      digitalWrite(lampuUV, HIGH);
       Serial.println("Lampu UV: MATI (Ruangan Terang)");
     }
   } else {
-    digitalWrite(lampuUV, HIGH); // Mematikan lampu UV di luar jam kerja
+    digitalWrite(lampuUV, HIGH);
     Serial.println("Lampu UV: MATI (Di luar periode kerja)");
   }
 }
